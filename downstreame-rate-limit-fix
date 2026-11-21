@@ -1,0 +1,197 @@
+# Solution: Handling 429s from a 10 TPS downstream
+
+## 1. The problem in simple words
+
+Your pipeline has **no speed control**. Kafka hands records to the consumers as fast as they can take them, but the slowest downstream API accepts only **10 requests per second**.
+
+| Item | Value |
+|---|---|
+| Pods × records per poll | 3 × 50 = **150 records in flight at once** |
+| Downstream limit (slowest plan) | **10 tps** |
+| Result | Bursts of up to 150 calls hit a 10 tps door, so most get **429** |
+
+The overall speed of the pipeline is decided by the **slowest downstream plan**, not by the number of pods. Adding pods would only make the 429s worse.
+
+### Current flow (what goes wrong)
+
+```mermaid
+flowchart LR
+    EXT["External app<br/>100,000 requests"] -->|REST| EFA["External facing app"]
+    EFA -->|"1 event per request"| K[("Kafka topic")]
+    K -->|"poll 50"| P1["Subscriber pod 1"]
+    K -->|"poll 50"| P2["Subscriber pod 2"]
+    K -->|"poll 50"| P3["Subscriber pod 3"]
+    P1 -->|"blocking REST"| ORCH["Domain orchestrator"]
+    P2 -->|"blocking REST"| ORCH
+    P3 -->|"blocking REST"| ORCH
+    ORCH -->|"burst, no limiter"| D1["Downstream API<br/>10 tps plan"]
+    D1 -. "HTTP 429" .-> ORCH
+    ORCH -. "failure" .-> P1
+
+    style D1 fill:#ffd6d6,stroke:#c00
+```
+
+### The math you must accept
+
+Whatever you build, the 10 tps limit is a hard ceiling:
+
+- 10,000 requests per batch ÷ 10 tps = about **17 minutes**
+- 100,000 requests ÷ 10 tps = about **2 hours 47 minutes**
+
+Aim for about **8 tps** (80% of the limit) as your safe target. That leaves headroom for retries, and the 100k batch then takes about 3.5 hours. Tell the external app owners the realistic completion time. This is a throughput limit, not a bug.
+
+---
+
+## 2. Target design: slow down at the source, protect at the edge
+
+The idea is to **let Kafka be the buffer** and make the pipeline pull work at the speed the downstream can handle.
+
+```mermaid
+flowchart LR
+    EXT["External app"] -->|"REST, returns 202"| EFA["External facing app"]
+    EFA --> K[("Kafka main topic")]
+    K -->|"throttled poll"| SUB["Event subscriber, 3 pods<br/>Layer 1: per-pod rate limit<br/>~2.5 tps each"]
+    SUB -->|"blocking REST"| ORCH["Domain orchestrator<br/>Layer 2: token bucket 8 tps<br/>per downstream"]
+    ORCH --> D1["Downstream API<br/>10 tps"]
+    D1 -- "200" --> ORCH
+    D1 -. "429 + Retry-After" .-> ORCH
+    ORCH -. "429/503 + Retry-After" .-> SUB
+    SUB -->|"Layer 3: retry with backoff"| RT[("Retry topic<br/>delayed")]
+    RT --> SUB
+    RT -->|"max retries exceeded"| DLQ[("Dead letter topic")]
+
+    style SUB fill:#d6f0ff,stroke:#07a
+    style ORCH fill:#d6ffd6,stroke:#0a0
+    style RT fill:#fff3cd,stroke:#a80
+```
+
+---
+
+## 3. Step-by-step guide
+
+### Step 1: Decide your safe target rate
+- Take the **lowest** plan among the downstream apps that a request touches (10 tps).
+- Target = 80% → **8 tps** total.
+- Per subscriber pod: 8 ÷ 3 ≈ **2.5 tps**.
+
+### Step 2: Throttle the Kafka consumer (Layer 1, no new pods)
+This is the most important change.
+
+- Lower `max.poll.records` from 50 to about **10**. A short poll loop avoids consumer rebalances.
+- Raise `max.poll.interval.ms` (for example 300000) so slow processing doesn't kick the pod out of the group.
+- Add a **rate limiter** (Resilience4j `RateLimiter`, Guava `RateLimiter` or Bucket4j) around the call to the orchestrator: 2.5 requests per second per pod.
+- Use a **small, bounded worker pool** (for example 2–4 threads). Don't process all polled records in parallel.
+- Make the pod count a config value (`POD_COUNT=3`). Then `rate_per_pod = TARGET_TPS / POD_COUNT`.
+- **Cap or disable autoscaling (HPA)** on the subscriber, otherwise a scale-up silently breaks the math.
+
+```java
+// Pseudocode
+RateLimiter limiter = RateLimiter.of("downstream", RateLimiterConfig.custom()
+    .limitForPeriod(5).limitRefreshPeriod(Duration.ofSeconds(2))   // 2.5 tps
+    .timeoutDuration(Duration.ofSeconds(30)).build());
+
+for (record : consumer.poll(Duration.ofSeconds(1))) {   // max.poll.records=10
+    limiter.acquirePermission();                          // waits for a token
+    callOrchestrator(record);
+}
+```
+
+### Step 3: Add a safety net in the orchestrator (Layer 2)
+Subscriber-side limits assume everyone behaves. The orchestrator is the **only** component that talks to the downstream, so it should protect it.
+
+- Add a **token bucket per downstream API** at 8 tps (configurable per plan: 50, 30, 10).
+- If no token is available, wait briefly (up to 2–5 s), then reject with **HTTP 429/503 + `Retry-After`** rather than calling the downstream and getting hit.
+- Add a **bulkhead** (max concurrent calls) per downstream, so one slow domain can't use up all orchestrator threads.
+- Make sure the subscriber's HTTP timeout is **longer** than the orchestrator's queue wait. Otherwise you get timeouts that look like failures.
+
+### Step 4: Handle 429s properly (Layer 3)
+Even with limits, 429s can happen (clock drift, other consumers of the same API).
+
+```mermaid
+sequenceDiagram
+    participant S as Subscriber pod
+    participant O as Orchestrator
+    participant D as Downstream
+    participant R as Retry topic
+    participant Q as Dead letter topic
+
+    S->>O: Request (rate limited 2.5 tps)
+    O->>D: Call (token bucket 8 tps)
+    alt Success
+        D-->>O: 200
+        O-->>S: 200
+        S->>S: Commit offset
+    else 429 Too Many Requests
+        D-->>O: 429 + Retry-After
+        O-->>S: 429/503 + Retry-After
+        S->>R: Publish with retry count + 1 and not-before time
+        S->>S: Commit offset (main topic keeps moving)
+    end
+    R->>S: Consumed after delay
+    alt Retries exhausted
+        S->>Q: Send to DLQ for manual or later replay
+    end
+```
+
+Rules:
+- Honour the **`Retry-After`** header if present. Otherwise use **exponential backoff with jitter** (for example 1 s, 2 s, 4 s, 8 s with ±20% random).
+- Don't sleep inside the poll loop for long. Publish to a **retry topic** (or a tiered set: retry-1m, retry-5m), so the main topic keeps moving.
+- Retries must also pass through the rate limiter, or they will cause new 429s.
+- After N retries (for example 5), send the record to the **DLQ**.
+- Make the downstream call **idempotent** (send an idempotency key such as the request ID), since retries can duplicate.
+
+### Step 5: Add a circuit breaker (optional but useful)
+- If more than 50% of calls get 429 within 10 seconds, **open the circuit** for 10–30 s. Stop calling, and pause the Kafka consumer (`consumer.pause()`, then `resume()` later).
+- This lets the downstream recover instead of being hammered.
+
+### Step 6: Reduce the number of downstream calls
+Every call you avoid is free capacity under a 10 tps ceiling.
+- **Cache** repeated lookups (reference data, same customer or ID) in the orchestrator, using a short TTL.
+- **Deduplicate** identical requests in a batch.
+- Use a **bulk or batch endpoint** if the downstream offers one (one call for many items).
+- If a request doesn't need every domain, **call only the domains needed**.
+
+### Step 7: Monitor and tune
+Track these metrics:
+- Consumer lag per partition (shows how far behind you are)
+- Rate of 429s per downstream (target near 0)
+- Orchestrator limiter wait time and rejection count
+- Retry topic size and DLQ size
+- Actual tps to the downstream (should stay at or below 8)
+
+Then increase the target rate slowly (8 → 9 tps) while 429s stay at zero.
+
+---
+
+## 4. Options compared
+
+| Option | Where | Effort | Notes |
+|---|---|---|---|
+| Lower `max.poll.records` + consumer rate limiter | Subscriber | Low | **Do first.** Stops most 429s. |
+| Token bucket per downstream | Orchestrator | Low–Medium | **Do second.** Protects against all callers. |
+| Retry topic + backoff + DLQ | Subscriber | Medium | Handles leftover 429s without losing data. |
+| Circuit breaker + consumer pause | Subscriber/Orchestrator | Low | Good protection, adaptive. |
+| Caching, dedup, bulk API | Orchestrator | Medium | Reduces demand, so effective capacity grows. |
+| Distributed rate limiter (Redis token bucket) | Shared | Medium–High | Exact global 10 tps even if pods change. Needs a shared store. |
+| Async orchestrator (202 + callback) | Architecture | High | Long-term improvement. Removes blocking threads. |
+
+---
+
+## 5. Things to watch out for
+
+1. **Partition count.** The topic needs at least 3 partitions (ideally a multiple of 3), or some pods will sit idle.
+2. **Pod failure.** If one pod dies, the others still run at 2.5 tps each, so you're safe but slower. That is acceptable. A scale-up is the dangerous case.
+3. **Rebalances.** Long blocking loops without a poll cause consumer group rebalances and duplicate processing. Keep polls small and `max.poll.interval.ms` generous.
+4. **Different plans (50/30/10 tps).** If every request calls all domains, the 10 tps domain caps everything. If requests can be routed per domain, use **separate topics or consumer groups per domain**, so fast domains aren't slowed by the slow one.
+5. **Tell the caller.** The external app should receive **202 Accepted** with a status or callback mechanism, since results will take hours for 100k requests.
+
+---
+
+## 6. Recommended order of rollout
+
+1. **Day 1:** Lower `max.poll.records`, add the per-pod rate limiter, and cap the HPA.
+2. **Week 1:** Add the orchestrator token bucket and bulkhead, and handle `Retry-After`.
+3. **Week 2:** Add the retry topic, DLQ and metrics dashboard.
+4. **Later:** Caching, dedup, circuit breaker, and possibly a Redis-based global limiter.
+
+If you share your tech stack (Spring Boot, Node, etc.) and whether every request touches all domains or only some, I can give you exact config and code for each layer.
